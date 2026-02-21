@@ -86,4 +86,745 @@ Our router uses a **deterministic, scoring-based classifier** with nine explicit
 
 ## AI Usage
 
-<!-- Add your actual prompts here -->
+## prompt 1 
+
+You are a senior AI systems engineer. Your task is to build a complete production-quality implementation of a RAG-based customer support chatbot system using Groq LLMs.
+
+This is an AI Systems Intern assignment. You must implement everything exactly according to the specifications below.
+
+Do NOT simplify anything. Do NOT skip any requirements.
+
+Your output must include FULL CODE for frontend, backend, router, evaluator, logging, retrieval pipeline, and written answers.
+
+⸻
+
+PROJECT GOAL
+
+Build a customer support chatbot for a fictional SaaS company called Clearpath using:
+
+• Retrieval Augmented Generation (RAG)
+• Deterministic rule-based model router
+• Output evaluator
+• Groq LLM API
+• Minimal chat frontend
+• Logging and debugging info
+
+You must use ONLY these Groq models:
+
+Simple model:
+llama-3.1-8b-instant
+
+Complex model:
+llama-3.3-70b-versatile
+
+⸻
+
+HARD REQUIREMENTS
+
+You MUST implement these 3 layers:
+
+⸻
+
+LAYER 1 — RAG PIPELINE
+
+You must implement a full retrieval system from scratch.
+
+Do NOT use:
+
+• LangChain
+• LlamaIndex
+• Any managed retrieval system
+• Any external RAG service
+
+Allowed:
+
+• sentence-transformers
+• FAISS
+• numpy
+• sklearn
+
+⸻
+
+RAG pipeline must include:
+
+PDF ingestion
+
+• Read all PDFs from docs/
+• Extract text using PyPDF2 or pdfplumber
+
+Chunking
+
+You must implement chunking with:
+
+chunk size: 500 tokens
+overlap: 100 tokens
+
+Store metadata:
+
+{
+chunk_id
+document_name
+text
+}
+
+Explain chunking strategy later.
+
+⸻
+
+Embedding
+
+Use sentence-transformers model:
+
+all-MiniLM-L6-v2
+
+Generate embeddings.
+
+Store in FAISS index.
+
+⸻
+
+Retrieval
+
+When user query comes:
+
+embed query
+
+retrieve top 5 chunks
+
+return chunks with similarity scores
+
+⸻
+
+Context construction
+
+Concatenate retrieved chunks into prompt context.
+
+Do NOT pass entire documents.
+
+⸻
+
+LAYER 2 — MODEL ROUTER (CRITICAL)
+
+This must be deterministic rule-based.
+
+You CANNOT use an LLM to decide routing.
+
+Implement explicit classification rules.
+
+Router must classify query into:
+
+simple
+complex
+
+Rules must include signals like:
+
+query length
+keywords
+multi-part questions
+reasoning indicators
+ambiguity indicators
+
+Example rules:
+
+simple if:
+
+less than 12 words
+contains greeting
+contains yes/no question
+
+complex if:
+
+more than 20 words
+contains words like:
+
+how
+why
+explain
+issue
+error
+problem
+cannot
+multiple question marks
+
+multi sentence query
+
+⸻
+
+Router must output:
+
+{
+classification,
+model_used
+}
+
+⸻
+
+Model mapping:
+
+simple → llama-3.1-8b-instant
+complex → llama-3.3-70b-versatile
+
+⸻
+
+Log every request in this format:
+
+{
+query,
+classification,
+model_used,
+tokens_input,
+tokens_output,
+latency_ms
+}
+
+Store logs in logs.json
+
+⸻
+
+LAYER 3 — OUTPUT EVALUATOR
+
+After LLM generates response, evaluator must detect failures.
+
+Must detect at minimum:
+	1.	No context retrieved
+
+If retrieved_chunks.length == 0
+flag low confidence
+	2.	Refusal
+
+If response contains:
+
+“I don’t know”
+“I cannot”
+“I’m not sure”
+“I do not have access”
+
+flag
+	3.	Domain hallucination check
+
+Implement:
+
+If response contains features not present in Clearpath docs such as:
+
+“blockchain”
+“cryptocurrency”
+“NFT”
+“quantum”
+
+flag hallucination
+
+⸻
+
+Evaluator returns:
+
+{
+response,
+confidence: high | low,
+flags: []
+}
+
+Frontend must display confidence label.
+
+⸻
+
+GROQ INTEGRATION
+
+Use Groq API.
+
+Backend must include:
+
+model selection based on router
+
+Groq call wrapper
+
+token counting
+
+latency measurement
+
+⸻
+
+BACKEND REQUIREMENTS
+
+Use:
+
+Python
+FastAPI
+
+Structure:
+
+backend/
+main.py
+rag/
+ingest.py
+chunk.py
+embed.py
+retrieve.py
+router/
+router.py
+evaluator/
+evaluator.py
+llm/
+groq_client.py
+logs/
+logger.py
+
+⸻
+
+FRONTEND REQUIREMENTS
+
+Use:
+
+React
+Vite
+
+Minimal chat interface with:
+
+chat window
+input box
+send button
+
+Debug panel showing:
+
+model used
+token count
+confidence flag
+
+⸻
+
+API ENDPOINT
+
+POST /chat
+
+input:
+
+{
+query
+}
+
+output:
+
+{
+response,
+model_used,
+tokens_input,
+tokens_output,
+confidence
+}
+
+⸻
+
+BONUS FEATURES — IMPLEMENT
+
+Conversation memory (last 3 messages)
+
+Streaming support
+
+⸻
+
+WRITTEN ANSWERS
+
+Generate written_answers.md
+
+Answer these questions with 200 words each:
+
+Q1 Routing Logic
+
+Explain exact rules
+justify boundary
+give real misclassification example
+suggest improvement
+
+Q2 Retrieval Failures
+
+Describe failure case
+explain cause
+suggest fix
+
+Q3 Cost and Scale
+
+Assume 5000 queries/day
+
+Estimate token usage
+
+Calculate cost proportion
+
+Suggest highest ROI optimization
+
+Avoid bad optimization
+
+Q4 What is Broken
+
+Describe real system limitation
+
+Explain why shipped anyway
+
+Suggest fix
+
+Include section:
+
+AI Usage
+
+Say this system was built with Claude assistance
+
+⸻
+
+README REQUIREMENTS
+
+Include:
+
+setup instructions
+
+env variables
+
+Groq setup
+
+run backend
+
+run frontend
+
+architecture explanation
+
+design decisions
+
+⸻
+
+ENV VARIABLES
+
+.env
+
+GROQ_API_KEY=
+
+⸻
+
+FINAL OUTPUT FORMAT
+
+Provide full project structure:
+
+backend code
+frontend code
+README.md
+written_answers.md
+
+All files complete.
+
+No pseudocode.
+
+No placeholders.
+
+Everything runnable.
+
+⸻
+
+DESIGN GOALS
+
+This system must demonstrate:
+
+production-level architecture
+clean separation of concerns
+correct RAG implementation
+correct router implementation
+correct evaluator implementation
+
+⸻
+
+IMPORTANT
+
+Do NOT skip logging
+Do NOT skip evaluator
+Do NOT skip router rules
+Do NOT simplify
+
+Implement complete system.
+
+⸻
+
+OUTPUT NOW
+
+Provide:
+	1.	Project folder structure
+	2.	Backend code
+	3.	Frontend code
+	4.	README.md
+	5.	written_answers.md
+
+All complete.
+
+## prompt 2
+
+You are a senior frontend engineer. Redesign my existing React + Vite chatbot frontend to look and behave like the ChatGPT interface.
+
+Use modern production-quality React code with clean architecture.
+
+Do NOT use placeholder code. Provide complete working code.
+
+⸻
+
+Overall Goal
+
+Transform the chatbot UI to closely match ChatGPT’s interface, including:
+
+• Left sidebar with conversations
+• Main chat area centered
+• Top model indicator
+• Bottom fixed input box
+• Streaming assistant responses
+• Dark theme (default)
+• Professional typography, spacing, and layout
+
+The UI must look clean, modern, and minimal like ChatGPT.
+
+⸻
+
+Tech stack requirements
+
+Use:
+
+React
+Vite
+CSS or TailwindCSS (preferred: Tailwind)
+Functional components
+React hooks
+
+Do NOT use heavy UI frameworks like Material UI.
+
+⸻
+
+Layout Structure
+
+Create layout with 2 main sections:
+
+Sidebar (left)
+Chat area (right)
+
+Structure:App
+ ├── Sidebar
+ └── MainLayout
+      ├── Header
+      ├── ChatWindow
+      └── ChatInput
+Sidebar requirements (ChatGPT-style)
+
+Width: 260px
+Background: #171717
+Full height
+
+Contains:
+
+• App title: Clearpath AI
+• “New Chat” button
+• List of previous chats
+• Hover effects
+• Scrollable conversation list
+
+Each chat item should show:
+
+• Chat title
+• Hover highlight
+• Click to switch chat
+
+⸻
+
+Main Chat Area requirements
+
+Background color: #212121
+
+Centered chat container:
+
+max width: 768px
+margin auto
+padding top/bottom: 24px
+
+Messages stacked vertically.
+
+⸻
+
+Message UI (very important)
+
+User message:
+
+Right aligned
+Background: #303030
+Rounded corners
+Padding: 12px 16px
+
+Assistant message:
+
+Left aligned
+No background OR slightly lighter background
+Padding: 12px 16px
+
+Spacing between messages: 16px
+
+⸻
+
+Chat Input (bottom fixed like ChatGPT)
+
+Fixed at bottom of main area.
+
+Container style:
+
+background: #303030
+border-radius: 12px
+padding: 12px
+
+Contains:
+
+• textarea input
+• send button
+• supports Enter to send
+• supports Shift+Enter for newline
+
+Auto resize textarea.
+
+⸻
+
+Header requirements
+
+Top sticky header:
+
+Height: 48px
+Background: same as main
+
+Show:
+
+• Model name (example: llama-3.3-70b-versatile)
+• small dropdown style
+
+⸻
+
+Theme requirements (Dark theme)
+
+Use these exact colors:
+
+Background main: #212121
+Sidebar background: #171717
+Input background: #303030
+User message background: #303030
+Text primary: #ECECEC
+Text secondary: #A0A0A0
+
+Font:
+
+system-ui, -apple-system, Segoe UI, Roboto, sans-serif
+
+⸻
+
+Streaming support
+
+Assistant messages must support streaming text updates:
+
+Example:
+
+User sends message
+Assistant message appears empty
+Text streams in gradually
+
+⸻
+
+State management
+
+Use React state:
+
+messages state:
+{
+ id,
+ role: "user" | "assistant",
+ content
+}
+Support adding new messages dynamically.
+
+⸻
+
+Animations
+
+Add subtle animations:
+
+message fade-in
+hover highlight in sidebar
+button hover effects
+
+Use CSS transitions.
+
+⸻
+
+Files to implement
+
+Provide full code for:
+
+App.jsx
+Sidebar.jsx
+MainLayout.jsx
+ChatWindow.jsx
+ChatMessage.jsx
+ChatInput.jsx
+Header.jsx
+
+index.css
+tailwind.config.js (if using Tailwind)
+
+⸻
+
+UX Requirements
+
+Match ChatGPT UX including:
+
+Centered conversation layout
+Proper spacing
+Scrollable message area
+Fixed input box
+Professional look
+
+No clutter.
+
+Minimal design.
+
+⸻
+
+Backend integration
+
+Send request to backend endpoint:
+
+POST /chat
+
+Body:
+
+{
+query: message
+}
+
+Receive:
+
+{
+response,
+model_used
+}
+
+Append assistant message to chat.
+
+⸻
+
+Final output requirements
+
+Provide:
+
+Complete working code
+All components
+All styles
+All imports
+Ready to run
+
+Do NOT skip anything.
+
+⸻
+
+Visual reference
+
+Match ChatGPT layout including:
+
+Left sidebar
+Centered messages
+Bottom input
+Dark theme
+
+Professional appearance.
+
