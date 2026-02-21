@@ -1,59 +1,101 @@
 import { useState, useCallback, useRef } from "react";
-import ChatWindow from "./components/ChatWindow";
-import ChatInput from "./components/ChatInput";
-import DebugPanel from "./components/DebugPanel";
-import "./App.css";
+import Sidebar from "./components/Sidebar";
+import MainLayout from "./components/MainLayout";
 
 const API_URL = "http://localhost:8000";
 
-function App() {
-  const [messages, setMessages] = useState([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [debugInfo, setDebugInfo] = useState(null);
-  const [showDebug, setShowDebug] = useState(true);
-  const sessionId = useRef(`session-${Date.now()}`);
+function generateId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
 
-  const sendMessage = useCallback(
+function createNewChat() {
+  return {
+    id: generateId(),
+    title: "New chat",
+    messages: [],
+    model: null,
+    lastDebug: null,
+    lastSources: null,
+  };
+}
+
+export default function App() {
+  const [chats, setChats] = useState([createNewChat()]);
+  const [activeChatId, setActiveChatId] = useState(chats[0].id);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const abortRef = useRef(null);
+
+  const activeChat = chats.find((c) => c.id === activeChatId) || chats[0];
+
+  const updateChat = useCallback((chatId, updater) => {
+    setChats((prev) => prev.map((c) => (c.id === chatId ? updater(c) : c)));
+  }, []);
+
+  const handleNewChat = useCallback(() => {
+    const chat = createNewChat();
+    setChats((prev) => [chat, ...prev]);
+    setActiveChatId(chat.id);
+  }, []);
+
+  const handleDeleteChat = useCallback(
+    (chatId) => {
+      setChats((prev) => {
+        const filtered = prev.filter((c) => c.id !== chatId);
+        if (filtered.length === 0) {
+          const fresh = createNewChat();
+          setActiveChatId(fresh.id);
+          return [fresh];
+        }
+        if (chatId === activeChatId) {
+          setActiveChatId(filtered[0].id);
+        }
+        return filtered;
+      });
+    },
+    [activeChatId],
+  );
+
+  const handleSend = useCallback(
     async (text) => {
-      if (!text.trim() || isLoading) return;
+      if (!text.trim() || isStreaming) return;
 
-      // Add user message
-      const userMsg = { role: "user", content: text };
-      setMessages((prev) => [...prev, userMsg]);
-      setIsLoading(true);
-      setDebugInfo(null);
+      const userMsg = { id: generateId(), role: "user", content: text };
+      const assistantMsg = { id: generateId(), role: "assistant", content: "" };
+      const chatId = activeChatId;
 
-      // Add placeholder for assistant
-      const assistantMsg = { role: "assistant", content: "", streaming: true };
-      setMessages((prev) => [...prev, assistantMsg]);
+      updateChat(chatId, (c) => ({
+        ...c,
+        title: c.messages.length === 0 ? text.slice(0, 40) : c.title,
+        messages: [...c.messages, userMsg, assistantMsg],
+      }));
+
+      setIsStreaming(true);
+      const controller = new AbortController();
+      abortRef.current = controller;
 
       try {
-        // Use SSE streaming endpoint
-        const response = await fetch(`${API_URL}/chat/stream`, {
+        // Try SSE streaming endpoint
+        const res = await fetch(`${API_URL}/chat/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: text,
-            session_id: sessionId.current,
-          }),
+          body: JSON.stringify({ query: text, session_id: chatId }),
+          signal: controller.signal,
         });
 
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-        const reader = response.body.getReader();
+        const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
-        let fullResponse = "";
+        let fullText = "";
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
-
-          // Parse SSE events from buffer
           const lines = buffer.split("\n");
           buffer = lines.pop() || "";
 
@@ -62,131 +104,109 @@ function App() {
             if (line.startsWith("event: ")) {
               eventType = line.slice(7).trim();
             } else if (line.startsWith("data: ")) {
-              const data = line.slice(6);
               try {
-                const parsed = JSON.parse(data);
-
+                const parsed = JSON.parse(line.slice(6));
                 if (eventType === "chunk" && parsed.text) {
-                  fullResponse += parsed.text;
-                  setMessages((prev) => {
-                    const updated = [...prev];
-                    const last = updated[updated.length - 1];
-                    if (last && last.role === "assistant") {
-                      updated[updated.length - 1] = {
-                        ...last,
-                        content: fullResponse,
-                      };
-                    }
-                    return updated;
-                  });
+                  fullText += parsed.text;
+                  updateChat(chatId, (c) => ({
+                    ...c,
+                    messages: c.messages.map((m) =>
+                      m.id === assistantMsg.id
+                        ? { ...m, content: fullText }
+                        : m,
+                    ),
+                  }));
                 } else if (eventType === "metadata") {
-                  setDebugInfo(parsed);
-                  // Update message with sources
-                  setMessages((prev) => {
-                    const updated = [...prev];
-                    const last = updated[updated.length - 1];
-                    if (last && last.role === "assistant") {
-                      updated[updated.length - 1] = {
-                        ...last,
-                        streaming: false,
-                        sources: parsed.sources,
-                      };
-                    }
-                    return updated;
-                  });
+                  const model = parsed.debug?.model_used || null;
+                  updateChat(chatId, (c) => ({
+                    ...c,
+                    model,
+                    lastDebug: parsed.debug,
+                    lastSources: parsed.sources,
+                    messages: c.messages.map((m) =>
+                      m.id === assistantMsg.id
+                        ? { ...m, sources: parsed.sources, debug: parsed.debug }
+                        : m,
+                    ),
+                  }));
+                  // Auto-open debug panel on first response
+                  setDebugOpen(true);
                 }
               } catch {
-                // skip invalid JSON
+                /* skip unparseable lines */
               }
             }
           }
         }
       } catch (err) {
-        console.error("Chat error:", err);
-        // Fall back to standard endpoint
+        if (err.name === "AbortError") return;
+        // Fallback to non-streaming /chat
         try {
-          const response = await fetch(`${API_URL}/chat`, {
+          const res = await fetch(`${API_URL}/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              query: text,
-              session_id: sessionId.current,
-            }),
+            body: JSON.stringify({ query: text, session_id: chatId }),
           });
-
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-          const data = await response.json();
-          setMessages((prev) => {
-            const updated = [...prev];
-            updated[updated.length - 1] = {
-              role: "assistant",
-              content: data.response,
-              sources: data.sources,
-              streaming: false,
-            };
-            return updated;
-          });
-          setDebugInfo({ sources: data.sources, debug: data.debug });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          updateChat(chatId, (c) => ({
+            ...c,
+            model: data.debug?.model_used || null,
+            lastDebug: data.debug,
+            lastSources: data.sources,
+            messages: c.messages.map((m) =>
+              m.id === assistantMsg.id
+                ? {
+                    ...m,
+                    content: data.response,
+                    sources: data.sources,
+                    debug: data.debug,
+                  }
+                : m,
+            ),
+          }));
+          setDebugOpen(true);
         } catch (fallbackErr) {
-          setMessages((prev) => {
-            const updated = [...prev];
-            updated[updated.length - 1] = {
-              role: "assistant",
-              content: `⚠️ Error: Could not connect to the backend. Make sure the server is running on ${API_URL}.\n\nDetails: ${fallbackErr.message}`,
-              streaming: false,
-            };
-            return updated;
-          });
+          updateChat(chatId, (c) => ({
+            ...c,
+            messages: c.messages.map((m) =>
+              m.id === assistantMsg.id
+                ? {
+                    ...m,
+                    content: `⚠️ Could not connect to backend at ${API_URL}.\n\nIs the server running? Start it with:\n\`uvicorn main:app --port 8000 --reload\`\n\n${fallbackErr.message}`,
+                  }
+                : m,
+            ),
+          }));
         }
       } finally {
-        setIsLoading(false);
+        setIsStreaming(false);
+        abortRef.current = null;
       }
     },
-    [isLoading],
+    [activeChatId, isStreaming, updateChat],
   );
 
   return (
-    <div className="app-container">
-      <div className="chat-area">
-        {/* Header */}
-        <header className="chat-header">
-          <div className="chat-header__logo">C</div>
-          <div className="chat-header__info">
-            <h1>Clearpath Support</h1>
-            <p>AI-Powered Customer Support Assistant</p>
-          </div>
-          <div className="chat-header__status">
-            <div className="status-dot" />
-            <span>Online</span>
-          </div>
-        </header>
-
-        {/* Messages */}
-        <ChatWindow
-          messages={messages}
-          isLoading={isLoading}
-          onSuggestionClick={sendMessage}
-        />
-
-        {/* Input */}
-        <ChatInput onSend={sendMessage} disabled={isLoading} />
-      </div>
-
-      {/* Debug sidebar */}
-      {showDebug ? (
-        <DebugPanel data={debugInfo} onClose={() => setShowDebug(false)} />
-      ) : (
-        <button
-          className="debug-toggle-btn"
-          onClick={() => setShowDebug(true)}
-          title="Show debug panel"
-        >
-          🔧
-        </button>
-      )}
+    <div className="flex h-full">
+      <Sidebar
+        chats={chats}
+        activeChatId={activeChatId}
+        isOpen={sidebarOpen}
+        onSelectChat={setActiveChatId}
+        onNewChat={handleNewChat}
+        onDeleteChat={handleDeleteChat}
+        onToggle={() => setSidebarOpen((o) => !o)}
+      />
+      <MainLayout
+        chat={activeChat}
+        isStreaming={isStreaming}
+        sidebarOpen={sidebarOpen}
+        debugOpen={debugOpen}
+        onSend={handleSend}
+        onToggleSidebar={() => setSidebarOpen((o) => !o)}
+        onToggleDebug={() => setDebugOpen((o) => !o)}
+      />
     </div>
   );
 }
-
-export default App;

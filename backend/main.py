@@ -1,14 +1,16 @@
 """
 Clearpath RAG Chatbot — FastAPI Backend
-POST /chat — Standard chat endpoint
+POST /query — API contract endpoint (question/conversation_id)
+POST /chat — Legacy chat endpoint
 POST /chat/stream — SSE streaming endpoint
 """
 import os
 import json
+import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -26,7 +28,7 @@ from logs.logger import log_request
 faiss_index = None
 chunk_metadata = None
 
-# Conversation memory: session_id → list of last N user/assistant pairs
+# Conversation memory: conversation_id → list of last N user/assistant pairs
 MAX_MEMORY = 3
 conversation_memory: dict[str, list[dict]] = defaultdict(list)
 
@@ -40,9 +42,9 @@ DOCS_DIR = os.path.join(BASE_DIR, "docs")
 async def lifespan(app: FastAPI):
     """Load or build FAISS index on startup."""
     global faiss_index, chunk_metadata
-    
+
     print("\n🚀 Clearpath RAG Chatbot — Starting up...")
-    
+
     # Try loading persisted index first
     loaded = load_index()
     if loaded:
@@ -54,10 +56,10 @@ async def lifespan(app: FastAPI):
         chunks = chunk_documents(documents)
         faiss_index, chunk_metadata = build_index(chunks)
         print("  ✓ FAISS index built and persisted")
-    
+
     # Pre-load embedding model
     get_model()
-    
+
     print(f"  ✓ Ready! Index contains {faiss_index.ntotal} vectors\n")
     yield
     print("\n👋 Shutting down Clearpath chatbot...")
@@ -80,93 +82,82 @@ app.add_middleware(
 
 
 # ─── Request / Response Models ──────────────────────────────────────────
+
+# API Contract models (POST /query)
+class QueryRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    conversation_id: str | None = None
+
+
+class TokensInfo(BaseModel):
+    input: int
+    output: int
+
+
+class QueryMetadata(BaseModel):
+    model_used: str
+    classification: str
+    tokens: TokensInfo
+    latency_ms: int
+    chunks_retrieved: int
+    evaluator_flags: list[str]
+
+
+class SourceInfo(BaseModel):
+    document: str
+    page: int | None = None
+    relevance_score: float | None = None
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    metadata: QueryMetadata
+    sources: list[SourceInfo]
+    conversation_id: str
+
+
+# Legacy models for /chat/stream (used by frontend SSE)
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     session_id: str = Field(default="default")
 
 
-class SourceInfo(BaseModel):
-    chunk_id: int
-    document_name: str
-    similarity_score: float
+# ─── Helpers ────────────────────────────────────────────────────────────
+def _get_history(conv_id: str) -> list[dict]:
+    return list(conversation_memory[conv_id])
 
 
-class DebugInfo(BaseModel):
-    classification: str
-    model_used: str
-    complex_score: int
-    signals: list[str]
-    tokens_input: int
-    tokens_output: int
-    latency_ms: float
-    confidence: str
-    flags: list[str]
-
-
-class ChatResponse(BaseModel):
-    response: str
-    sources: list[SourceInfo]
-    debug: DebugInfo
-
-
-# ─── Helper ─────────────────────────────────────────────────────────────
-def _get_history(session_id: str) -> list[dict]:
-    """Get conversation history for a session."""
-    return list(conversation_memory[session_id])
-
-
-def _update_history(session_id: str, query: str, response: str):
-    """Store user/assistant pair in session memory (max N pairs)."""
-    history = conversation_memory[session_id]
-    history.append({"role": "user", "content": query})
-    history.append({"role": "assistant", "content": response})
-    # Keep only last MAX_MEMORY pairs (2 messages each)
+def _update_history(conv_id: str, question: str, answer: str):
+    history = conversation_memory[conv_id]
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": answer})
     if len(history) > MAX_MEMORY * 2:
-        conversation_memory[session_id] = history[-(MAX_MEMORY * 2):]
+        conversation_memory[conv_id] = history[-(MAX_MEMORY * 2):]
 
 
-# ─── Endpoints ──────────────────────────────────────────────────────────
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """
-    Main chat endpoint.
-    Pipeline: retrieve → route → call Groq → evaluate → log → respond
-    """
-    query = request.query.strip()
-    session_id = request.session_id
-    
-    print(f"\n{'='*60}")
-    print(f"  Query: {query}")
-    print(f"  Session: {session_id}")
-    
-    # Step 1: Retrieve relevant chunks
-    retrieved = retrieve(query, faiss_index, chunk_metadata)
-    
-    # Step 2: Route query to appropriate model
-    routing = classify_query(query)
-    
-    # Step 3: Build context from retrieved chunks
+def _run_pipeline(question: str, conv_id: str):
+    """Shared pipeline logic for both /query and /chat endpoints."""
+    retrieved = retrieve(question, faiss_index, chunk_metadata)
+    routing = classify_query(question)
+
     context = "\n\n".join(
         f"[Source: {c['document_name']}, Chunk #{c['chunk_id']}, "
         f"Similarity: {c['similarity_score']}]\n{c['text']}"
         for c in retrieved
     ) if retrieved else "No relevant documentation found."
-    
-    # Step 4: Call Groq LLM
-    history = _get_history(session_id)
+
+    history = _get_history(conv_id)
     llm_result = chat_completion(
         model=routing["model_used"],
         context=context,
-        query=query,
+        query=question,
         conversation_history=history,
     )
-    
-    # Step 5: Evaluate response
+
     evaluation = evaluate_response(llm_result["response"], retrieved)
-    
-    # Step 6: Log the request
+
     log_request(
-        query=query,
+        query=question,
         classification=routing["classification"],
         model_used=routing["model_used"],
         tokens_input=llm_result["tokens_input"],
@@ -176,70 +167,124 @@ async def chat(request: ChatRequest):
         flags=evaluation["flags"],
         num_sources=len(retrieved),
     )
-    
-    # Step 7: Update conversation memory
-    _update_history(session_id, query, evaluation["response"])
-    
-    # Step 8: Build response
+
+    _update_history(conv_id, question, evaluation["response"])
+
+    return {
+        "retrieved": retrieved,
+        "routing": routing,
+        "llm_result": llm_result,
+        "evaluation": evaluation,
+    }
+
+
+# ─── POST /query — API Contract Endpoint ────────────────────────────────
+@app.post("/query", response_model=QueryResponse)
+async def query_endpoint(request: QueryRequest):
+    """
+    API contract endpoint matching the assignment spec.
+    POST /query with {question, conversation_id?}
+    """
+    question = request.question.strip()
+    conv_id = request.conversation_id or f"conv_{uuid.uuid4().hex[:8]}"
+
+    print(f"\n{'='*60}")
+    print(f"  Query: {question}")
+    print(f"  Conversation: {conv_id}")
+
+    result = _run_pipeline(question, conv_id)
+
     sources = [
         SourceInfo(
-            chunk_id=c["chunk_id"],
-            document_name=c["document_name"],
-            similarity_score=c["similarity_score"],
+            document=c["document_name"],
+            page=None,
+            relevance_score=c["similarity_score"],
         )
-        for c in retrieved
+        for c in result["retrieved"]
     ]
-    
-    debug = DebugInfo(
-        classification=routing["classification"],
-        model_used=routing["model_used"],
-        complex_score=routing["complex_score"],
-        signals=routing["signals"],
-        tokens_input=llm_result["tokens_input"],
-        tokens_output=llm_result["tokens_output"],
-        latency_ms=llm_result["latency_ms"],
-        confidence=evaluation["confidence"],
-        flags=evaluation["flags"],
+
+    metadata = QueryMetadata(
+        model_used=result["routing"]["model_used"],
+        classification=result["routing"]["classification"],
+        tokens=TokensInfo(
+            input=result["llm_result"]["tokens_input"],
+            output=result["llm_result"]["tokens_output"],
+        ),
+        latency_ms=int(result["llm_result"]["latency_ms"]),
+        chunks_retrieved=len(result["retrieved"]),
+        evaluator_flags=result["evaluation"]["flags"],
     )
-    
+
     print(f"{'='*60}\n")
-    
-    return ChatResponse(
-        response=evaluation["response"],
+
+    return QueryResponse(
+        answer=result["evaluation"]["response"],
+        metadata=metadata,
         sources=sources,
-        debug=debug,
+        conversation_id=conv_id,
     )
 
 
+# ─── POST /chat — Legacy endpoint (used by frontend) ───────────────────
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """Legacy /chat endpoint maintained for frontend compatibility."""
+    question = request.query.strip()
+    conv_id = request.session_id
+
+    result = _run_pipeline(question, conv_id)
+
+    return {
+        "response": result["evaluation"]["response"],
+        "sources": [
+            {
+                "document": c["document_name"],
+                "chunk_id": c["chunk_id"],
+                "document_name": c["document_name"],
+                "similarity_score": c["similarity_score"],
+            }
+            for c in result["retrieved"]
+        ],
+        "debug": {
+            "classification": result["routing"]["classification"],
+            "model_used": result["routing"]["model_used"],
+            "complex_score": result["routing"]["complex_score"],
+            "signals": result["routing"]["signals"],
+            "tokens_input": result["llm_result"]["tokens_input"],
+            "tokens_output": result["llm_result"]["tokens_output"],
+            "latency_ms": result["llm_result"]["latency_ms"],
+            "confidence": result["evaluation"]["confidence"],
+            "flags": result["evaluation"]["flags"],
+        },
+    }
+
+
+# ─── POST /chat/stream — SSE Streaming ─────────────────────────────────
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """
-    Streaming chat endpoint using Server-Sent Events (SSE).
-    Streams response chunks, then sends a final metadata event.
-    """
-    query = request.query.strip()
-    session_id = request.session_id
-    
-    # Retrieve + Route (same as standard endpoint)
-    retrieved = retrieve(query, faiss_index, chunk_metadata)
-    routing = classify_query(query)
-    
+    """SSE streaming endpoint for the frontend."""
+    question = request.query.strip()
+    conv_id = request.session_id
+
+    retrieved = retrieve(question, faiss_index, chunk_metadata)
+    routing = classify_query(question)
+
     context = "\n\n".join(
         f"[Source: {c['document_name']}, Chunk #{c['chunk_id']}, "
         f"Similarity: {c['similarity_score']}]\n{c['text']}"
         for c in retrieved
     ) if retrieved else "No relevant documentation found."
-    
-    history = _get_history(session_id)
-    
+
+    history = _get_history(conv_id)
+
     async def event_generator():
         full_response = ""
         final_meta = {}
-        
+
         for item in chat_completion_stream(
             model=routing["model_used"],
             context=context,
-            query=query,
+            query=question,
             conversation_history=history,
         ):
             if "chunk" in item:
@@ -247,13 +292,11 @@ async def chat_stream(request: ChatRequest):
             elif item.get("done"):
                 full_response = item.get("response", "")
                 final_meta = item
-        
-        # Evaluate
+
         evaluation = evaluate_response(full_response, retrieved)
-        
-        # Log
+
         log_request(
-            query=query,
+            query=question,
             classification=routing["classification"],
             model_used=routing["model_used"],
             tokens_input=final_meta.get("tokens_input", 0),
@@ -263,20 +306,19 @@ async def chat_stream(request: ChatRequest):
             flags=evaluation["flags"],
             num_sources=len(retrieved),
         )
-        
-        # Update memory
-        _update_history(session_id, query, full_response)
-        
-        # Send final metadata event
+
+        _update_history(conv_id, question, full_response)
+
         sources = [
             {
+                "document": c["document_name"],
                 "chunk_id": c["chunk_id"],
                 "document_name": c["document_name"],
                 "similarity_score": c["similarity_score"],
             }
             for c in retrieved
         ]
-        
+
         meta = {
             "sources": sources,
             "debug": {
@@ -293,13 +335,13 @@ async def chat_stream(request: ChatRequest):
         }
         yield {"event": "metadata", "data": json.dumps(meta)}
         yield {"event": "done", "data": "{}"}
-    
+
     return EventSourceResponse(event_generator())
 
 
+# ─── Health Check ───────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
     return {
         "status": "ok",
         "index_size": faiss_index.ntotal if faiss_index else 0,

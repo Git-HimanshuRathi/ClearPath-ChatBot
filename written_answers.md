@@ -1,47 +1,89 @@
-# Written Answers — Clearpath RAG Chatbot
+# Written Answers
+
+## Q1 — Routing Logic
+
+Our router uses a **deterministic, scoring-based classifier** with nine explicit signals. Each signal adds or subtracts from a `complex_score`:
+
+**Rules:**
+
+- **Word count ≥ 20:** +2 (long queries need reasoning)
+- **Reasoning keywords** (explain, compare, why, how, recommend, troubleshoot, etc.): +2
+- **Comparison patterns** (vs, versus, "difference between", "which plan"): +1
+- **Complaint/issue keywords** (not working, broken, error, bug, crash): +1
+- **Multiple question marks (≥ 2):** +1 (multi-part question)
+- **Multiple sentences (≥ 3):** +1 (complex context)
+- **Word count < 8:** -2 (short = simple)
+- **Greeting pattern** (hi, hello, hey): -2
+- **Yes/No pattern** (yes, no, sure, okay): -1
+
+**Boundary:** `complex_score ≥ 2` → `llama-3.3-70b-versatile`, else → `llama-3.1-8b-instant`. We chose this threshold because a single strong signal (like reasoning keywords) is enough to justify the 70B model — these queries genuinely need deeper reasoning. But weak signals alone (just being slightly long) shouldn't trigger the expensive model.
+
+**Misclassification example:** "What's the SLA for enterprise support?" scores 0: no reasoning keywords, 6 words (−2 for short query). Classified as "simple." But this requires cross-referencing the Enterprise Plan Details and Support SLA documents — complex multi-doc synthesis. The 8B model gives a shallow answer.
+
+**Improvement without LLM:** Add topic-aware routing with a small keyword taxonomy — queries mentioning "SLA", "enterprise", "migration", or "compliance" get +1 because these topics inherently require detailed, multi-source answers regardless of query length. This avoids LLM cost while catching domain-specific complexity.
 
 ---
 
-## Q1: How does your model router classify queries, and what are the boundary conditions where it might misclassify?
+## Q2 — Retrieval Failures
 
-The model router employs a **scoring-based deterministic classification** system rather than a simple keyword if/else approach. Each incoming query is evaluated against seven binary signals that increment or decrement a `complex_score`. Positive signals include: long query (word count > 20, +2), presence of reasoning keywords like "explain", "compare", or "troubleshoot" (+2), multiple question marks (+1), and multi-sentence structure (+1). Negative signals include: short query (word count < 12, -2), greeting patterns like "hi" or "hello" (-2), and yes/no responses (-1). If the cumulative score reaches 3 or above, the query is classified as "complex" and routed to `llama-3.3-70b-versatile`; otherwise it goes to `llama-3.1-8b-instant`.
+**Query:** "What did the team discuss in last week's standup?"
 
-The primary **boundary condition for misclassification** occurs with edge-case queries that are semantically complex but syntactically simple. For example, "Why is SSO failing?" is a short 4-word query (triggering -2) with one reasoning keyword (+2), yielding a score of 0 — classified as "simple" despite requiring deep troubleshooting analysis. Conversely, a long greeting like "Hello, I hope you're having a wonderful day, I just wanted to say thank you for your excellent product and amazing support team" would score +2 for length despite being trivially simple. The scoring system trades perfect classification for determinism, transparency, and zero additional API latency — a deliberate design choice where the debugging visibility (score breakdown + signals) outweighs marginal accuracy gains from an LLM-based classifier.
+**What retrieved:** Chunks from `24_Weekly_Standup_Notes_Dec2023.pdf` with similarity scores of 0.28-0.35. The system returned standup notes from December 2023 as if they were "last week."
 
----
+**Why it failed:** Our RAG pipeline uses pure semantic similarity via cosine distance — it matched "standup" and "team discuss" without understanding temporal context. The system has no concept of document dates or recency. The permissive 0.25 similarity threshold let these marginally relevant chunks through.
 
-## Q2: Explain your RAG retrieval strategy and how it handles the case where no relevant documents are found.
+**Our domain-specific evaluator checks:** We implemented two domain-specific checks beyond the required no-context and refusal detection:
 
-The retrieval strategy operates as a multi-step pipeline: First, the user query is embedded using `all-MiniLM-L6-v2` (a 384-dimensional sentence transformer model). The embedding is **explicitly L2-normalized** using `faiss.normalize_L2()`, ensuring that inner product search in the FAISS `IndexFlatIP` index yields true cosine similarity scores. The index then returns the top-5 nearest neighbors with their similarity scores.
+1. **Context-overlap check** — Measures what percentage of the LLM's response content words appear in the retrieved chunks. If overlap drops below 30%, we flag `potential_hallucination`. This catches cases where the LLM generates information that diverges from the provided context, such as inventing feature details not in any chunk. We chose this because it directly measures grounding: a well-grounded response should substantially reference the source material.
 
-The critical **threshold filter (Improvement 3)** then discards any chunks scoring below 0.25 cosine similarity. This is essential because FAISS always returns K results regardless of actual relevance — without the threshold, off-topic queries like "Tell me about blockchain" would still receive 5 chunks about Clearpath, leading the LLM to fabricate connections between irrelevant context and the query.
+2. **Unsourced pricing detection** — Extracts dollar amounts from the LLM's response and cross-checks them against amounts in the retrieved chunks. If the response mentions prices not found in any source document, we flag `unsourced_pricing`. This is critical for a SaaS support bot where incorrect pricing can cause real customer harm.
 
-When **no chunks survive the threshold filter**, the system returns an empty retrieval list. This triggers a cascade of safety mechanisms: (1) the context passed to the LLM reads "No relevant documentation found", (2) the strict grounding system prompt instructs the LLM to refuse rather than guess, and (3) the evaluator flags the response with `no_context`, setting confidence to "low". This three-layer defense — retrieval threshold, grounding prompt, evaluator flag — ensures the system gracefully handles out-of-scope queries rather than hallucinating answers.
-
-An **LRU cache (Improvement 8)** stores up to 128 recent query embeddings, keyed by normalized query text. This avoids redundant embedding computation for repeated questions, which is particularly valuable in customer support contexts where FAQ-style queries recur frequently.
+**Fix:** Add metadata-aware retrieval — index document dates alongside content, apply temporal boost to newer documents, and implement a pre-retrieval filter for temporal queries.
 
 ---
 
-## Q3: If you could add one optimization to improve production readiness, what would it be and why?
+## Q3 — Cost and Scale
 
-The highest-ROI optimization would be **implementing query embedding caching with a persistent Redis backend** alongside semantic deduplication. While the current LRU cache (Improvement 8) avoids redundant embedding computation within a single server process, it is lost on restart and isolated per worker process. In production, customer support workloads exhibit a **Zipfian distribution** — a small set of common questions ("How do I reset my password?", "What are the pricing plans?") accounts for a disproportionate share of total queries.
+**Assumptions:** 5,000 queries/day, 70% simple / 30% complex (typical support distribution).
 
-A persistent cache with **semantic deduplication** would: (1) embed the query, (2) search the cache for semantically similar past queries (cosine similarity > 0.95), (3) if found, return the cached retrieval results and even cached LLM responses directly, bypassing the entire pipeline. This would reduce both Groq API costs (which scale linearly with requests) and p99 latency from ~2s to ~50ms for cached queries. Implementation would involve Redis with a secondary FAISS index over cached query embeddings, with TTL-based expiration and cache invalidation when the document index is rebuilt.
+**Token estimates per query:**
 
-This single optimization addresses three production concerns simultaneously: **cost** (fewer LLM API calls), **latency** (sub-100ms for cache hits), and **scalability** (reduces load on the Groq API rate limit of 1,000-5,000 req/min). It also enables offline analytics on query patterns, informing documentation improvements for the most-asked questions.
+- Context (5 chunks × 500 tokens): ~2,500 input tokens
+- System prompt + query: ~200 input tokens
+- Conversation memory (3 turns): ~600 input tokens
+- **Total input per query:** ~3,300 tokens
+- **Output per query:** ~300 tokens
+
+**Daily breakdown:**
+
+| Model                   | Queries/day | Input tokens | Output tokens | Total tokens |
+| ----------------------- | ----------- | ------------ | ------------- | ------------ |
+| llama-3.1-8b-instant    | 3,500       | 11.55M       | 1.05M         | 12.6M        |
+| llama-3.3-70b-versatile | 1,500       | 4.95M        | 0.45M         | 5.4M         |
+| **Total**               | 5,000       | 16.5M        | 1.5M          | **18M**      |
+
+**Proportional cost estimate (Groq pricing proxy):** Using Groq's free-tier rate limits as a proxy: the 8B model processes tokens ~4x faster but the 70B model consumes significantly more compute per token. Even at 30% of traffic, the 70B model is the dominant cost driver because per-token compute scales with model parameters.
+
+**Biggest cost driver:** Input tokens (16.5M) outweigh output (1.5M) by 11:1 — specifically the 5 chunks × 500 tokens of context per query. The context window is the primary cost lever.
+
+**Highest-ROI optimization:** Implement a **semantic query cache** using embedding similarity. Hash incoming query embeddings and return cached responses for queries with cosine similarity > 0.95. Customer support queries are highly repetitive (users ask the same pricing/setup questions). Caching could eliminate 40-60% of LLM calls entirely — saving both tokens and latency at near-zero marginal cost.
+
+**Optimization to avoid:** Reducing chunk retrieval count from 5 to 1 or 2. While this cuts input tokens by 60%, it severely degrades quality for complex questions requiring synthesis across multiple document sections (e.g., comparing pricing plans across two PDFs). The quality-cost tradeoff is not worth it — a wrong answer is more expensive than a few extra tokens.
 
 ---
 
-## Q4: Describe how the evaluator detects potential hallucinations and what its limitations are.
+## Q4 — What Is Broken
 
-The evaluator implements a **two-pronged hallucination detection** strategy. The first mechanism is a **keyword blacklist** — it checks if the LLM response contains out-of-domain terms like "blockchain", "cryptocurrency", "NFT", or "quantum" that should never appear in Clearpath documentation context. This catches obvious cases where the model generates content from its pre-training data rather than the provided context.
+**The most significant flaw:** Our similarity threshold (0.25) is **too permissive**, causing the system to retrieve and present marginally relevant chunks as authoritative context. This means the LLM frequently receives "context" that is topically adjacent but doesn't actually answer the question — leading to plausible-sounding but inaccurate responses that the user trusts.
 
-The second, more sophisticated mechanism is the **context-overlap check (Improvement 4)**. It extracts non-stopword "content words" from both the LLM response and the retrieved context chunks, then computes a word-level overlap ratio. If fewer than 30% of the response's content words appear in the context, the response is flagged as `potential_hallucination`. For example, if the context discusses "sprint planning" and "task management" but the response starts discussing "machine learning workflows" and "neural networks", the overlap would drop well below 30%, triggering the flag.
+**Concrete example:** Asking about "API rate limits" retrieves chunks about "API authentication" and "API endpoints" — close enough semantically to pass the 0.25 threshold but containing zero rate limit information. The LLM then synthesizes a confident answer from this tangential context, producing what appears to be a well-sourced response that is actually hallucinated from wrong context. This is strictly worse than "I don't know" because the user trusts a sourced answer.
 
-The **primary limitation** is that this approach operates at the lexical level rather than the semantic level. A hallucinated response that cleverly uses the same vocabulary as the context but arranges it into factually incorrect statements would pass the overlap check. For instance, if the context says "Free plan supports 5 users" but the model responds "Free plan supports 50 users", the overlap would be high (same words) but the answer is factually wrong. Additionally, the 30% threshold is a heuristic — legitimate responses that paraphrase heavily or use synonyms (saying "cost" instead of "price") could be incorrectly flagged. Production systems would benefit from adding NLI-based (Natural Language Inference) entailment checking, where a smaller model verifies that the response is actually entailed by the context rather than merely sharing vocabulary.
+**Why shipped anyway:** Raising the threshold to 0.5+ caused too many queries to return zero results, especially for paraphrased questions where embedding similarity is naturally lower (e.g., "how to cancel" vs "cancellation policy" scores ~0.35). With only 30 documents and 49 chunks, the index is sparse — aggressive filtering leaves users without answers for legitimate questions. We chose permissive retrieval over no retrieval, relying on the evaluator's context-overlap check (30% threshold) and unsourced-pricing detection as safety nets to catch the worst cases.
+
+**Fix:** Replace the flat threshold with **dynamic threshold pruning** based on score distribution — if the top chunk scores 0.7 but chunk #4 scores 0.28, drop chunks below 50% of the top score. This adapts to each query's retrieval landscape rather than using a fixed cutoff. For a more robust solution, add a **cross-encoder re-ranking step** using `cross-encoder/ms-marco-MiniLM-L-6-v2` that re-scores the top-5 FAISS candidates with a model trained specifically for relevance assessment.
 
 ---
 
-## AI Usage Declaration
+## AI Usage
 
-This project was developed with the assistance of AI coding tools (Claude/Anthropic). AI was used for code generation, architecture design, documentation writing, and debugging. All generated code was reviewed, tested, and validated for correctness. The conceptual architecture, design decisions, and improvement strategies reflect understanding of RAG systems, vector databases, and LLM grounding techniques.
+<!-- Add your actual prompts here -->

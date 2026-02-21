@@ -7,6 +7,8 @@ __pycache__/
 *.pyc
 *.pyo
 data/
+logs.json
+eval_results.json
 
 # Node
 node_modules/
