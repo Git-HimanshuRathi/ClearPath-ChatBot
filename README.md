@@ -1,8 +1,12 @@
 # Clearpath RAG Chatbot
 
+🚀 **Live Demo → [http://51.20.86.17](http://51.20.86.17)** (Deployed on AWS)
+
 A **Retrieval-Augmented Generation (RAG)** customer support chatbot for **Clearpath**, a fictional SaaS project management platform.
 
 Built with **FastAPI**, **Groq LLMs**, **FAISS**, and a **React/Vite** frontend styled like ChatGPT.
+
+![Deployed](https://img.shields.io/badge/Deployed-AWS%20EC2-FF9900?logo=amazonaws) ![Status](https://img.shields.io/badge/Status-Live-brightgreen)
 
 ---
 
@@ -26,9 +30,16 @@ User Query → RAG Retrieval → Model Router → Groq LLM → Evaluator → Res
 
 ---
 
-## Quick Start
+## 🌐 Live Demo
 
-> **Full setup instructions →** [SETUP.md](SETUP.md)
+> **[http://51.20.86.17](http://51.20.86.17)**
+
+---
+
+## Local Development
+
+<details>
+<summary>Click to expand setup instructions</summary>
 
 ```bash
 # 1. Setup
@@ -43,7 +54,7 @@ cd backend && uvicorn main:app --port 8000 --reload
 cd frontend && npm install && npm run dev
 ```
 
-Open **http://localhost:5173**
+</details>
 
 ---
 
